@@ -6,7 +6,9 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"golang.org/x/oauth2"
 
 	"github.com/bmizerany/assert"
 	"github.com/coreos/go-oidc"
@@ -40,7 +42,7 @@ type RedeemResponse struct {
 	IDToken      string `json:"id_token,omitempty"`
 }
 
-var TestIDToken = IDTokenClaims{
+var defaultIDToken IDTokenClaims = IDTokenClaims{
 	"Jane Dobbs",
 	"janed@me.com",
 	"http://mugbook.com/janed/me.jpg",
@@ -55,14 +57,38 @@ var TestIDToken = IDTokenClaims{
 	},
 }
 
-type NoOpKeySet struct{}
-
-func (NoOpKeySet) VerifySignature(ctx context.Context, jwt string) (payload []byte, err error) {
-	payloadPart := strings.Split(jwt, ".")[1]
-	return base64.RawURLEncoding.DecodeString(payloadPart)
+type KeySetStub struct {
+	DecodedJson *IDTokenClaims
 }
 
-func newOIDCProvider(serverURL *url.URL) *OIDCProvider {
+func (c KeySetStub) VerifySignature(_ context.Context, jwt string) (payload []byte, err error) {
+	decodeString, err := base64.RawURLEncoding.DecodeString(strings.Split(jwt, ".")[1])
+	tokenClaims := &IDTokenClaims{}
+	err = json.Unmarshal(decodeString, tokenClaims)
+
+	if err != nil || tokenClaims.Id == "this-id-fails-validation" {
+		return nil, fmt.Errorf("the validation failed for subject [%v]", tokenClaims.Subject)
+	}
+
+	return decodeString, err
+}
+
+var defaultIdTokenVerifier = oidc.NewVerifier(
+	"https://issuer.example.com",
+	KeySetStub{},
+	&oidc.Config{ClientID: clientID},
+)
+
+func newOIDCProvider(serverURL *url.URL, verifier *oidc.IDTokenVerifier) *OIDCProvider {
+
+	idTokenVerifier := (*oidc.IDTokenVerifier)(nil)
+
+	if verifier == nil {
+		idTokenVerifier = defaultIdTokenVerifier
+	} else {
+		idTokenVerifier = verifier
+	}
+
 	providerData := &ProviderData{
 		ProviderName: "oidc",
 		ClientID:     clientID,
@@ -87,11 +113,7 @@ func newOIDCProvider(serverURL *url.URL) *OIDCProvider {
 
 	p := &OIDCProvider{
 		ProviderData: providerData,
-		Verifier: oidc.NewVerifier(
-			"https://issuer.example.com",
-			NoOpKeySet{},
-			&oidc.Config{ClientID: clientID},
-		),
+		Verifier:     idTokenVerifier,
 	}
 
 	return p
@@ -100,102 +122,102 @@ func newOIDCProvider(serverURL *url.URL) *OIDCProvider {
 func newOIDCServer(body []byte) (*url.URL, *httptest.Server) {
 	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Add("content-type", "application/json")
-		rw.Write(body)
+		_, _ = rw.Write(body)
 	}))
 	u, _ := url.Parse(s.URL)
 	return u, s
 }
 
-func getSignedTestIDToken() (string, error) {
+func newSignedTestIDToken(tokenClaims IDTokenClaims) (string, error) {
 
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-	standardClaims := jwt.NewWithClaims(jwt.SigningMethodRS256, TestIDToken)
+	standardClaims := jwt.NewWithClaims(jwt.SigningMethodRS256, tokenClaims)
 	return standardClaims.SignedString(key)
+}
+
+func newOauth2Token() *oauth2.Token {
+	return &oauth2.Token{
+		AccessToken:  accessToken,
+		TokenType:    "Bearer",
+		RefreshToken: refreshToken,
+		Expiry:       time.Time{}.Add(time.Duration(5) * time.Second),
+	}
+}
+
+func newTestSetup(body []byte) (*httptest.Server, *OIDCProvider) {
+	redeemURL, server := newOIDCServer(body)
+	provider := newOIDCProvider(redeemURL, defaultIdTokenVerifier)
+	return server, provider
 }
 
 func TestOIDCProviderRedeem(t *testing.T) {
 
-	signedIDToken, err := getSignedTestIDToken()
-	assert.Equal(t, nil, err)
-
-	body, err := json.Marshal(RedeemResponse{
+	idToken, _ := newSignedTestIDToken(defaultIDToken)
+	body, _ := json.Marshal(RedeemResponse{
 		AccessToken:  accessToken,
 		ExpiresIn:    10,
 		TokenType:    "Bearer",
 		RefreshToken: refreshToken,
-		IDToken:      signedIDToken,
+		IDToken:      idToken,
 	})
-	assert.Equal(t, nil, err)
 
-	var server *httptest.Server
-	redeemURL, server := newOIDCServer(body)
-	p := newOIDCProvider(redeemURL)
+	server, provider := newTestSetup(body)
 	defer server.Close()
 
-	session, err := p.Redeem(p.RedeemURL.String(), "code1234")
+	session, err := provider.Redeem(provider.RedeemURL.String(), "code1234")
 	assert.Equal(t, nil, err)
-	assert.Equal(t, TestIDToken.Email, session.Email)
+	assert.Equal(t, defaultIDToken.Email, session.Email)
 	assert.Equal(t, accessToken, session.AccessToken)
-	assert.Equal(t, signedIDToken, session.IDToken)
+	assert.Equal(t, idToken, session.IDToken)
 	assert.Equal(t, refreshToken, session.RefreshToken)
 	assert.Equal(t, "123456789", session.User)
-	// Expiry and creation not tested until a clock can be used instead
 }
 
 func TestOIDCProviderRefreshSessionIfNeededWithoutIdToken(t *testing.T) {
 
-	signedIDToken, err := getSignedTestIDToken()
-	assert.Equal(t, nil, err)
-
-	body, err := json.Marshal(RedeemResponse{
+	idToken, _ := newSignedTestIDToken(defaultIDToken)
+	body, _ := json.Marshal(RedeemResponse{
 		AccessToken:  accessToken,
 		ExpiresIn:    10,
 		TokenType:    "Bearer",
 		RefreshToken: refreshToken,
 	})
-	assert.Equal(t, nil, err)
 
-	var server *httptest.Server
-	redeemURL, server := newOIDCServer(body)
-	p := newOIDCProvider(redeemURL)
+	server, provider := newTestSetup(body)
 	defer server.Close()
 
 	existingSession := &sessions.SessionState{
 		AccessToken:  "changeit",
-		IDToken:      signedIDToken,
+		IDToken:      idToken,
 		CreatedAt:    time.Time{},
 		ExpiresOn:    time.Time{},
 		RefreshToken: refreshToken,
 		Email:        "janedoe@example.com",
 		User:         "123456789",
 	}
-	refreshed, err := p.RefreshSessionIfNeeded(existingSession)
+
+	refreshed, err := provider.RefreshSessionIfNeeded(existingSession)
 	assert.Equal(t, nil, err)
 	assert.Equal(t, refreshed, true)
 	assert.Equal(t, "janedoe@example.com", existingSession.Email)
 	assert.Equal(t, accessToken, existingSession.AccessToken)
-	assert.Equal(t, signedIDToken, existingSession.IDToken)
+	assert.Equal(t, idToken, existingSession.IDToken)
 	assert.Equal(t, refreshToken, existingSession.RefreshToken)
 	assert.Equal(t, "123456789", existingSession.User)
 }
 
 func TestOIDCProviderRefreshSessionIfNeededWithIdToken(t *testing.T) {
 
-	signedIDToken, err := getSignedTestIDToken()
-	assert.Equal(t, nil, err)
-
-	body, err := json.Marshal(RedeemResponse{
+	idToken, _ := newSignedTestIDToken(defaultIDToken)
+	body, _ := json.Marshal(RedeemResponse{
 		AccessToken:  accessToken,
 		ExpiresIn:    10,
 		TokenType:    "Bearer",
 		RefreshToken: refreshToken,
-		IDToken:      signedIDToken,
+		IDToken:      idToken,
 	})
-	assert.Equal(t, nil, err)
 
-	var server *httptest.Server
-	redeemURL, server := newOIDCServer(body)
-	p := newOIDCProvider(redeemURL)
+	server, provider := newTestSetup(body)
 	defer server.Close()
 
 	existingSession := &sessions.SessionState{
@@ -207,46 +229,47 @@ func TestOIDCProviderRefreshSessionIfNeededWithIdToken(t *testing.T) {
 		Email:        "janedoe@example.com",
 		User:         "123456789",
 	}
-	refreshed, err := p.RefreshSessionIfNeeded(existingSession)
+	refreshed, err := provider.RefreshSessionIfNeeded(existingSession)
 	assert.Equal(t, nil, err)
 	assert.Equal(t, refreshed, true)
-	assert.Equal(t, TestIDToken.Email, existingSession.Email)
+	assert.Equal(t, defaultIDToken.Email, existingSession.Email)
 	assert.Equal(t, accessToken, existingSession.AccessToken)
-	assert.Equal(t, signedIDToken, existingSession.IDToken)
+	assert.Equal(t, idToken, existingSession.IDToken)
 	assert.Equal(t, refreshToken, existingSession.RefreshToken)
 	assert.Equal(t, "123456789", existingSession.User)
 }
 
 func TestOIDCProvider_findVerifiedIdToken(t *testing.T) {
 
-	provider := new(OIDCProvider)
+	server, provider := newTestSetup([]byte(""))
 
-	verifierFn := func(rawIdToken string) (*oidc.IDToken, error) {
-		switch {
-		case rawIdToken == "some-token":
-			return new(oidc.IDToken), nil
-		case rawIdToken == "error":
-			return nil, fmt.Errorf("kerblam")
-		default:
-			return nil, nil
-		}
-	}
+	defer server.Close()
 
-	findTokenFn := func(in string) func() (string, bool) {
-		return func() (string, bool) {
-			return in, len(in) > 0
-		}
-	}
+	token := newOauth2Token()
+	signedIdToken, _ := newSignedTestIDToken(defaultIDToken)
+	tokenWithIdToken := token.WithExtra(map[string]interface{}{
+		"id_token": signedIdToken,
+	})
 
-	token, err := provider.extractIDToken(findTokenFn("some-token"), verifierFn)
-	assert.Equal(t, new(oidc.IDToken), token)
+	verifiedIdToken, err := provider.findVerifiedIDToken(context.Background(), tokenWithIdToken)
+	assert.Equal(t, true, err == nil)
+	assert.Equal(t, true, verifiedIdToken != nil)
+	assert.Equal(t, defaultIDToken.Issuer, verifiedIdToken.Issuer)
+	assert.Equal(t, defaultIDToken.Subject, verifiedIdToken.Subject)
+
+	// When the validation fails the response should be nil
+	defaultIDToken.Id = "this-id-fails-validation"
+	signedIdToken, _ = newSignedTestIDToken(defaultIDToken)
+	tokenWithIdToken = token.WithExtra(map[string]interface{}{
+		"id_token": signedIdToken,
+	})
+
+	verifiedIdToken, err = provider.findVerifiedIDToken(context.Background(), tokenWithIdToken)
+	assert.Equal(t, errors.New("failed to verify signature: the validation failed for subject [123456789]"), err)
+	assert.Equal(t, true, verifiedIdToken == nil)
+
+	// When there is no id token in the oauth token
+	verifiedIdToken, err = provider.findVerifiedIDToken(context.Background(), newOauth2Token())
 	assert.Equal(t, nil, err)
-
-	token, err = provider.extractIDToken(findTokenFn("error"), verifierFn)
-	assert.Equal(t, true, token == nil)
-	assert.Equal(t, fmt.Errorf("kerblam"), err)
-
-	token, err = provider.extractIDToken(findTokenFn(""), verifierFn)
-	assert.Equal(t, true, token == nil)
-	assert.Equal(t, nil, err)
+	assert.Equal(t, true, verifiedIdToken == nil)
 }
